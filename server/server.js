@@ -16,7 +16,7 @@ app.use(express.json());
 await connectDB();
   
 // Sync models (creates tables if they don't exist)
-await sequelize.sync({ alter: true });
+await sequelize.sync();
 
 // Mount routers
 app.use("/api/users", userRouter);

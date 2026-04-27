@@ -15,6 +15,22 @@ const User = sequelize.define("User", {
   password: {
     type: DataTypes.STRING,
   },
+  lock_until: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  lock_count: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+  },
+  last_lock_time: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  manual_unlock_required: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+  },
 });
 
 // 🔐 Password hash

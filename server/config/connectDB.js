@@ -8,7 +8,6 @@
 //     process.exit(1); // Exit process if DB fails
 //   }
 // };
-
 // export default connectDB;
 
 

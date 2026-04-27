@@ -6,6 +6,7 @@ import {
   updateUser,
   deleteUser,
   getAllUsers,
+  unlockUser,
 } from "../controllers/userController.js";
 import { protect, authorizeRoles } from "../middleware/authMiddleware.js";
 
@@ -16,6 +17,7 @@ router.post("/", registerUser);
 router.post("/login", loginUser);
 router.get("/me", protect, getMe);
 router.put("/:id", protect, updateUser);
+router.put("/:id/unlock", protect, authorizeRoles("Admin"), unlockUser);
 router.delete("/:id", protect, authorizeRoles("Admin"), deleteUser);
 
 export default router;
