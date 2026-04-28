@@ -96,7 +96,7 @@ export const loginUser = async (req, res, next) => {
     // ⏱️ 2. Throttle Check
     const isThrottled = await checkThrottle(user, ipAddress);
     if (isThrottled) {
-      return res.status(429).json({ message: "Your account has been blocked, try again later" });
+      return res.status(429).json({ message: "Too many login attempts. Please try again later" });
     }
 
     // 🔑 3. Password Check
@@ -111,7 +111,10 @@ export const loginUser = async (req, res, next) => {
       });
     }
 
-    // ❌ 4. Failure Check
+    // 🛡️ 4. Artificial Delay (Security Tip)
+    await new Promise(res => setTimeout(res, 300));
+
+    // ❌ 5. Failure Check
     const failureResult = await handleLoginFailure(user, ipAddress);
     return res.status(failureResult.status).json({ 
       message: failureResult.message,

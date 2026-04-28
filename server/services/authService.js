@@ -6,10 +6,12 @@ export const checkUserLock = (user) => {
   if (!user) return null;
 
   if (user.manual_unlock_required) {
+    console.warn(`🔒 Access denied: Account for ${user.email} is permanently locked (Scenario 4).`);
     return { status: 403, message: "Your account has been locked, please contact support" };
   }
 
   if (user.lock_until && user.lock_until > new Date()) {
+    console.warn(`⏳ Access denied: Account for ${user.email} is temporarily blocked.`);
     return { status: 403, message: "Your account has been blocked, try again later" };
   }
 
@@ -23,20 +25,30 @@ export const checkThrottle = async (user, ipAddress) => {
   let userFailures5m = 0;
   let lastUserFailure = null;
   if (user) {
-    const userFails = await LoginAttempt.findAll({
-      where: { userId: user.id, status: "FAIL", createdAt: { [Op.gte]: fiveMinsAgo } },
-      order: [['createdAt', 'DESC']]
+    userFailures5m = await LoginAttempt.count({
+      where: { userId: user.id, status: "FAIL", createdAt: { [Op.gte]: fiveMinsAgo } }
     });
-    userFailures5m = userFails.length;
-    if (userFails.length > 0) lastUserFailure = userFails[0].createdAt;
+    if (userFailures5m > 0) {
+      const lastFail = await LoginAttempt.findOne({
+        where: { userId: user.id, status: "FAIL", createdAt: { [Op.gte]: fiveMinsAgo } },
+        order: [['createdAt', 'DESC']]
+      });
+      lastUserFailure = lastFail?.createdAt;
+    }
   }
 
-  const ipFails = await LoginAttempt.findAll({
-    where: { ipAddress, status: "FAIL", createdAt: { [Op.gte]: fiveMinsAgo } },
-    order: [['createdAt', 'DESC']]
+  const ipFailures5m = await LoginAttempt.count({
+    where: { ipAddress, status: "FAIL", createdAt: { [Op.gte]: fiveMinsAgo } }
   });
-  const ipFailures5m = ipFails.length;
-  const lastIpFailure = ipFails.length > 0 ? ipFails[0].createdAt : null;
+  
+  let lastIpFailure = null;
+  if (ipFailures5m > 0) {
+    const lastFail = await LoginAttempt.findOne({
+      where: { ipAddress, status: "FAIL", createdAt: { [Op.gte]: fiveMinsAgo } },
+      order: [['createdAt', 'DESC']]
+    });
+    lastIpFailure = lastFail?.createdAt;
+  }
 
   const maxFailures5m = Math.max(userFailures5m, ipFailures5m);
   
@@ -53,6 +65,7 @@ export const checkThrottle = async (user, ipAddress) => {
     if (mostRecentFailureTime) {
       const timeSinceLastFail = (Date.now() - mostRecentFailureTime.getTime()) / 1000;
       if (timeSinceLastFail < delaySeconds) {
+        console.warn(`⚠️ Throttling active for IP/User. Delay required: ${Math.round(delaySeconds)}s`);
         isThrottled = true;
       }
     }
@@ -75,17 +88,14 @@ export const handleLoginSuccess = async (user, ipAddress) => {
     status: "SUCCESS",
   });
 
-  // Send email asynchronously
-  try {
-    const loginTime = new Date().toLocaleString();
-    await sendEmail(
-      user.email, 
-      "Login Alert", 
-      `You have logged in successfully.\n\nTime: ${loginTime}\nIP Address: ${ipAddress}\n\nIf this wasn't you, please change your password immediately.`
-    );
-  } catch (err) {
-    console.error("Login email failed", err);
-  }
+  // Fire-and-forget email (non-blocking)
+  console.log(`✅ Login success for ${user.email}. Resetting failure counters.`);
+  const loginTime = new Date().toLocaleString();
+  sendEmail(
+    user.email, 
+    "Login Alert", 
+    `You have logged in successfully.\n\nTime: ${loginTime}\nIP Address: ${ipAddress}\n\nIf this wasn't you, please change your password immediately.`
+  ).catch(err => console.error("Login email failed", err));
 };
 
 export const handleLoginFailure = async (user, ipAddress) => {
@@ -107,7 +117,7 @@ export const handleLoginFailure = async (user, ipAddress) => {
 
     if (userFailures15m >= 10) { // Threshold hit
       const lockUntil = new Date(Date.now() + 15 * 60 * 1000);
-      let newLockCount = user.lock_count + 1;
+      let newLockCount = (user.lock_count || 0) + 1;
       const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
       
       if (user.last_lock_time && user.last_lock_time < twentyFourHoursAgo) {
@@ -127,29 +137,33 @@ export const handleLoginFailure = async (user, ipAddress) => {
       });
 
       if (manualUnlock) {
-         try {
-           const contactUrl = process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/contact` : "http://localhost:8000/contact";
-           const htmlContent = `Your account is locked permanently.<br><br>Please <a href="${contactUrl}">contact support</a>.`;
-           await sendEmail(
-             user.email, 
-             "Account Locked - Action Required", 
-             "Your account is locked permanently.\n\nPlease contact support.", 
-             htmlContent
-           );
-         } catch (err) {
-           console.error("Manual lock email failed", err);
-         }
+         console.error(`🚨 PERMANENT LOCK TRIGGERED for ${user.email} (3rd lock in 24h).`);
+         const contactUrl = process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/contact` : "http://localhost:8000/contact";
+         const htmlContent = `Your account is locked permanently.<br><br>Please <a href="${contactUrl}">contact support</a>.`;
+         
+         // Non-blocking email
+         sendEmail(
+           user.email, 
+           "Account Locked - Action Required", 
+           "Your account is locked permanently.\n\nPlease contact support.", 
+           htmlContent
+         ).catch(err => console.error("Manual lock email failed", err));
+
          return { 
            status: 403, 
            message: "Your account has been locked, please contact support",
-           supportUrl: process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/contact` : "http://localhost:8000/contact"
+           supportUrl: contactUrl
          };
       } else {
-         try {
-           await sendEmail(user.email, "Temporary Account Lock", "Your account is temporarily locked.\n\nTry again after 15 minutes.");
-         } catch (err) {
-           console.error("Temporary lock email failed", err);
-         }
+         console.warn(`🛡️ Temporary 15-minute lock triggered for ${user.email} (Failure count: ${newLockCount}).`);
+         
+         // Non-blocking email
+         sendEmail(
+           user.email, 
+           "Temporary Account Lock", 
+           "Your account is temporarily locked.\n\nTry again after 15 minutes."
+         ).catch(err => console.error("Temporary lock email failed", err));
+
          return { status: 403, message: "Your account has been blocked, try again later" };
       }
     }
