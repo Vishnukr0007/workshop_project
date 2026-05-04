@@ -1,7 +1,9 @@
-import jwt from "jsonwebtoken"; 
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import User from "../models/user.js";
 import Role from "../models/role.js";
 import sendEmail from "../utils/sendEmail.js";
+import { getLockoutEmailTemplate } from "../utils/emailTemplates.js";
 import { checkUserLock, checkThrottle, handleLoginSuccess, handleLoginFailure } from "../services/authService.js";
 
 // Generate JWT token with role payload
@@ -89,13 +91,25 @@ export const loginUser = async (req, res, next) => {
     if (lockError) {
       return res.status(lockError.status).json({ 
         message: lockError.message,
-        ...(lockError.supportUrl && { supportUrl: lockError.supportUrl })
+        ...(lockError.supportUrl && { supportUrl: lockError.supportUrl }),
+        requiresVerification: lockError.message.includes("verify")
       });
     }
 
     // ⏱️ 2. Throttle Check
     const isThrottled = await checkThrottle(user, ipAddress);
     if (isThrottled) {
+      // 🚨 Record the failure even while throttled to progress towards Scenario 2 (Blocking)
+      const throttleFailure = await handleLoginFailure(user, ipAddress);
+      
+      // If the throttled attempt triggers the 10th failure lockout, return the 403 response
+      if (throttleFailure.status === 403) {
+        return res.status(403).json({ 
+          message: throttleFailure.message,
+          ...(throttleFailure.supportUrl && { supportUrl: throttleFailure.supportUrl })
+        });
+      }
+
       return res.status(429).json({ message: "Too many login attempts. Please try again later" });
     }
 
@@ -118,7 +132,8 @@ export const loginUser = async (req, res, next) => {
     const failureResult = await handleLoginFailure(user, ipAddress);
     return res.status(failureResult.status).json({ 
       message: failureResult.message,
-      ...(failureResult.supportUrl && { supportUrl: failureResult.supportUrl })
+      ...(failureResult.supportUrl && { supportUrl: failureResult.supportUrl }),
+      requiresVerification: failureResult.message.includes("verify")
     });
 
   } catch (error) {
@@ -218,6 +233,109 @@ export const unlockUser = async (req, res, next) => {
     }
 
     res.status(200).json({ message: "User account has been successfully unlocked." });
+  } catch (error) {
+    next(error);
+  }
+};
+// @desc Request an OTP to unlock account
+export const requestUnlock = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ where: { email } });
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.account_status !== "VERIFY_REQUIRED") {
+      return res.status(400).json({ message: "Account does not require verification" });
+    }
+
+    // Cooldown check (1 min)
+    if (user.otp_expiry && new Date() < new Date(user.otp_expiry.getTime() - 9 * 60 * 1000)) {
+       return res.status(429).json({ message: "Please wait before requesting another OTP." });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const hashedOtp = await bcrypt.hash(otp, 10);
+    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    await user.update({
+      otp_code: hashedOtp,
+      otp_expiry: expiry,
+      otp_attempts: 0
+    });
+
+    try {
+      const emailHtml = getLockoutEmailTemplate({
+        userName: user.name,
+        otp: otp,
+        unlockLink: process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/unlock` : "http://localhost:3000/unlock",
+        supportLink: process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/support` : "http://localhost:3000/support",
+        time: new Date().toLocaleString(),
+        ipAddress: req.ip,
+        companyName: "Charity Platform",
+        supportEmail: process.env.EMAIL_USER || "support@charityplatform.com"
+      });
+
+      await sendEmail(
+        user.email,
+        "⚠️ Action Required: Unlock Your Account",
+        `Your account was locked due to multiple failed login attempts.\n\nYour OTP is: ${otp}\nThis code is valid for 10 minutes.`,
+        emailHtml
+      );
+    } catch (err) {
+      console.error("Unlock OTP email failed", err);
+      return res.status(500).json({ message: "Failed to send email" });
+    }
+
+    res.status(200).json({ message: "OTP sent to your email" });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc Verify OTP to unlock account
+export const verifyUnlock = async (req, res, next) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ message: "Please provide email and OTP" });
+    }
+
+    const user = await User.findOne({ where: { email } });
+
+    if (!user || user.account_status !== "VERIFY_REQUIRED") {
+      return res.status(400).json({ message: "Invalid request" });
+    }
+
+    if (!user.otp_code || !user.otp_expiry || new Date() > user.otp_expiry) {
+      return res.status(400).json({ message: "OTP has expired. Please request a new one." });
+    }
+
+    if (user.otp_attempts >= 5) {
+      return res.status(400).json({ message: "Too many failed attempts. Please request a new OTP." });
+    }
+
+    const isMatch = await bcrypt.compare(otp, user.otp_code);
+
+    if (isMatch) {
+      await user.update({
+        account_status: "ACTIVE",
+        lock_until: null,
+        lock_count: 0,
+        manual_unlock_required: false,
+        otp_code: null,
+        otp_expiry: null,
+        otp_attempts: 0
+      });
+
+      res.status(200).json({ message: "Account unlocked successfully" });
+    } else {
+      await user.update({ otp_attempts: user.otp_attempts + 1 });
+      res.status(400).json({ message: "Invalid OTP" });
+    }
   } catch (error) {
     next(error);
   }

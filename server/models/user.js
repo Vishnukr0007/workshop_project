@@ -31,6 +31,22 @@ const User = sequelize.define("User", {
     type: DataTypes.BOOLEAN,
     defaultValue: false,
   },
+  account_status: {
+    type: DataTypes.ENUM("ACTIVE", "TEMP_LOCK", "VERIFY_REQUIRED", "SUSPICIOUS"),
+    defaultValue: "ACTIVE",
+  },
+  otp_code: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  otp_expiry: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  otp_attempts: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+  },
 });
 
 // 🔐 Password hash

@@ -1,16 +1,18 @@
 import { Op } from "sequelize";
 import LoginAttempt from "../models/LoginAttempt.js";
 import sendEmail from "../utils/sendEmail.js";
+import { getLockoutEmailTemplate } from "../utils/emailTemplates.js";
 
 export const checkUserLock = (user) => {
+
   if (!user) return null;
 
-  if (user.manual_unlock_required) {
-    console.warn(`🔒 Access denied: Account for ${user.email} is permanently locked (Scenario 4).`);
-    return { status: 403, message: "Your account has been locked, please contact support" };
+  if (user.account_status === "VERIFY_REQUIRED" || user.manual_unlock_required) {
+    console.warn(`🔒 Access denied: Account for ${user.email} requires verification.`);
+    return { status: 403, message: "Account locked. Please verify to unlock." };
   }
 
-  if (user.lock_until && user.lock_until > new Date()) {
+  if (user.lock_until && new Date(user.lock_until) > new Date()) {
     console.warn(`⏳ Access denied: Account for ${user.email} is temporarily blocked.`);
     return { status: 403, message: "Your account has been blocked, try again later" };
   }
@@ -76,9 +78,13 @@ export const checkThrottle = async (user, ipAddress) => {
 export const handleLoginSuccess = async (user, ipAddress) => {
   // Reset lock fields on success
   await user.update({
+    account_status: "ACTIVE",
     lock_until: null,
     lock_count: 0,
-    manual_unlock_required: false
+    manual_unlock_required: false,
+    otp_code: null,
+    otp_expiry: null,
+    otp_attempts: 0
   });
 
   // Record successful login attempt
@@ -117,10 +123,19 @@ export const handleLoginFailure = async (user, ipAddress) => {
 
     if (userFailures15m >= 10) { // Threshold hit
       const lockUntil = new Date(Date.now() + 15 * 60 * 1000);
-      let newLockCount = (user.lock_count || 0) + 1;
       const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
       
-      if (user.last_lock_time && user.last_lock_time < twentyFourHoursAgo) {
+      let newLockCount = (user.lock_count || 0);
+
+      // 🛡️ Only increment lock_count if this is a NEW lockout event
+      // (Account wasn't already locked in the last 15 mins)
+      const lastLockExpired = user.last_lock_time ? new Date(new Date(user.last_lock_time).getTime() + 15 * 60 * 1000) : null;
+      if (!lastLockExpired || new Date() > lastLockExpired) {
+        newLockCount += 1;
+      }
+
+      // Reset count if the last lock was more than 24 hours ago
+      if (user.last_lock_time && new Date(user.last_lock_time) < twentyFourHoursAgo) {
         newLockCount = 1;
       }
 
@@ -133,34 +148,42 @@ export const handleLoginFailure = async (user, ipAddress) => {
         lock_until: lockUntil,
         lock_count: newLockCount,
         last_lock_time: new Date(),
-        manual_unlock_required: manualUnlock
+        manual_unlock_required: manualUnlock,
+        account_status: manualUnlock ? "VERIFY_REQUIRED" : "TEMP_LOCK"
       });
 
       if (manualUnlock) {
-         console.error(`🚨 PERMANENT LOCK TRIGGERED for ${user.email} (3rd lock in 24h).`);
-         const contactUrl = process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/contact` : "http://localhost:8000/contact";
-         const htmlContent = `Your account is locked permanently.<br><br>Please <a href="${contactUrl}">contact support</a>.`;
+         console.error(`🚨 VERIFY_REQUIRED TRIGGERED for ${user.email} (3rd lock in 24h).`);
          
+         const emailHtml = getLockoutEmailTemplate({
+           userName: user.name,
+           unlockLink: process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/unlock` : "http://localhost:3000/unlock",
+           supportLink: process.env.CLIENT_URL ? `${process.env.CLIENT_URL}/support` : "http://localhost:3000/support",
+           time: new Date().toLocaleString(),
+           ipAddress: ipAddress,
+           companyName: "Charity Platform",
+           supportEmail: process.env.EMAIL_USER || "support@charityplatform.com"
+         });
+
          // Non-blocking email
          sendEmail(
            user.email, 
-           "Account Locked - Action Required", 
-           "Your account is locked permanently.\n\nPlease contact support.", 
-           htmlContent
-         ).catch(err => console.error("Manual lock email failed", err));
+           "⚠️ Action Required: Account Locked - Verification Required", 
+           "Your account has been locked due to multiple failed login attempts.\n\nPlease use the unlock account feature to regain access.",
+           emailHtml
+         ).catch(err => console.error("Verify required email failed", err));
 
          return { 
            status: 403, 
-           message: "Your account has been locked, please contact support",
-           supportUrl: contactUrl
+           message: "Account locked. Please verify to unlock."
          };
       } else {
-         console.warn(`🛡️ Temporary 15-minute lock triggered for ${user.email} (Failure count: ${newLockCount}).`);
+         console.warn(`🛡️ Temporary 15-minute lock triggered for ${user.email} (Lock count: ${newLockCount}).`);
          
          // Non-blocking email
          sendEmail(
            user.email, 
-           "Temporary Account Lock", 
+           "Account Temporarily Locked", 
            "Your account is temporarily locked.\n\nTry again after 15 minutes."
          ).catch(err => console.error("Temporary lock email failed", err));
 
